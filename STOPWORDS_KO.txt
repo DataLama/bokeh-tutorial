@@ -1,0 +1,7 @@
+[UNK]
+[PAD]
+[URL]
+[IMAGE]
+[EMAIL]
+[HASHTAG]
+[MENTION]

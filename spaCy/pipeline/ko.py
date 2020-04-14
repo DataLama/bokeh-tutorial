@@ -2,11 +2,10 @@ import os
 import re
 import string
 import pickle
-from typing import List, Tuple,Dict
+from typing import List, Tuple
 from soynlp.tokenizer import LTokenizer
 from soynlp.normalizer import repeat_normalize
-from emoji import emojize, demojize
-
+from emoji import emojize, demojize, get_emoji_regexp
 from spacy.tokens import Doc, Token
 from spacy.lang.ko import Korean
 from spacy.util import DummyTokenizer
@@ -17,11 +16,11 @@ class Tokenizer:
         self
     ):
         # load noun cohesion score
-        with open('pipeline/words.p', 'rb') as rf:
+        with open('utils/words.p', 'rb') as rf:
             words = pickle.load(rf)    
             cohesion_score = {word: score.cohesion_forward for word, score in words.items()}
             cohesion_score = {k: v for k, v in sorted(cohesion_score.items(), key=lambda item: item[1], reverse=True) if v > 0}      
-        with open('pipeline/nouns.p', 'rb') as rf:
+        with open('utils/nouns.p', 'rb') as rf:
             nouns = pickle.load(rf)
             noun_score = {noun: score.score for noun, score in nouns.items()}
             noun_cohesion_score = {noun: score + cohesion_score.get(noun, 0) for noun, score in noun_score.items()} 
@@ -30,31 +29,54 @@ class Tokenizer:
         self._soy = LTokenizer(scores=self._noun_cohesion_score)
         self._is_flatten = False # no_flatten
         self._is_remove_r = False # no_remove
+        self._emo = get_emoji_regexp() # re compiled
+        
         
     def _preprocess(self, doc: str) -> str:
         """전처리 로직"""
         doc = str(doc).lower().strip() # make string, lower and strip
-#         doc = re.sub(r'[\d+‘’]','', doc) # 연속하는 숫자 제거
-#         doc = re.sub(f'[{string.punctuation}]','', doc) # 기초 특수문자 제거
-        doc = repeat_normalize(doc, num_repeats=3) # 연속 3글자 이상의 글자 normalize하기.
-        doc = emojize(demojize(doc, delimiters=(' :', ': '))).strip() # 이모지 사이에 공백 추가.
+        doc = re.sub(rf'([^{self._emo.pattern}{string.punctuation}\s\w]+)',' ', doc) # 숫자, 문자, whitespace, 이모지, 일반특수문자를 제외한 모든 유니코드 제거.
+        doc = re.sub(r'\s',' ', doc) #white space character 변환 
+        doc = re.sub('&nbsp;',' ', doc) #&nbsp; 제거
+        doc = re.sub('&lt;','<',doc) #기타 html특수기호
+        doc = re.sub('&gt;','>',doc) #기타 html특수기호
+        doc = re.sub('&amp;','&',doc) #기타 html특수기호
+        doc = re.sub('&quot;','""',doc) #기타 html특수기호
+        doc = re.sub(r'(http\S+[^가-힣])|([a-zA-Z]+.\S+.\S+[^가-힣])',r' [URL] ',doc) #url 변환
+        doc = re.sub(r'(\[image#0\d\])', r' [IMAGE] ', doc) # Image Tag
+        doc = re.sub(r'([0-9a-zA-Z_]|[^\s^\w])+(@)[a-zA-Z]+.[a-zA-Z)]+',r' [EMAIL] ', doc) #email
+        doc = re.sub(r'#(\w+)',r' [HASHTAG] ', doc) #Hashtag
+        doc = re.sub(r'@(\w+)',r' [MENTION] ', doc) #MENTION
+        doc = emojize(demojize(doc, delimiters=(' :', ': '))).strip()
         return doc
     
-    def _postprocess(self, doc:List[Tuple[str]]) -> List[Dict]:
+    def _postprocess(self, doc:List[str]) -> List[Tuple[str]]:
         """후처리 로직"""
         processed_doc = []
+        
         for l_part, r_part in doc:
-            processed_doc.append({'words': l_part,'spaces':False ,'tag_' : 'L'})        
-            if r_part !='':
-                processed_doc.append({'words': r_part ,'spaces':True ,'tag_' : 'R'})
+            
+            ## l_part
+            l_part = repeat_normalize(l_part, num_repeats=3)
+            sub_l_part = re.findall(r"[\w]+|[\W]+", l_part)
+            if len(sub_l_part)==2:
+                processed_doc += [(sub, 'L') for sub in sub_l_part] 
             else:
-                processed_doc[-1].update({'spaces':True})
-
-        if processed_doc != []:
-            processed_doc[-1].update({'spaces':False}) # 마지막은 무조건 false
+                processed_doc.append((l_part, 'L'))      
+            
+            ## r_part
+            if r_part !='':
+                r_part = repeat_normalize(r_part, num_repeats=3)
+                sub_r_part = re.findall(r"[\w]+|[\W]+", r_part)
+                if len(sub_r_part)==2:
+                    processed_doc += [(sub, 'R') for sub in sub_r_part] 
+                else:
+                    processed_doc.append((r_part, 'R'))
+            
+                
         return processed_doc
         
-    def tokenize(self, doc: str, media_type: str = None) -> List[str]:
+    def tokenize(self, doc: str, media_type: str = None) -> List[Tuple[str]]:
         """tokenize function
         Use noun cohesion score with soynlp
         
@@ -63,10 +85,10 @@ class Tokenizer:
         """
         
         doc = self._soy.tokenize(self._preprocess(doc), flatten=self._is_flatten, remove_r = self._is_remove_r) # returns list of tuple
-        doc = self._postprocess(doc) 
+        doc = self._postprocess(doc)
         
         return doc
-
+    
     
 class SpacyTokenizer(DummyTokenizer): # wrapping for spacy
     def __init__(self, vocab):
@@ -83,25 +105,4 @@ class SpacyTokenizer(DummyTokenizer): # wrapping for spacy
         for token, t in zip(doc, tag_):
             token._.set('tag_', t)
         
-        return doc    
-    
-    
-if __name__ == "__main__":
-    #### Tokenizer Examples
-    import ray
-    ray.init(num_cpus=64, object_store_memory = 200000 * 1024 * 1024, driver_object_store_memory = 100000 * 1024 * 1024)
-    import modin.pandas as pd
-    
-    ## load data and define variables
-    file_path = 'data/Korean.parquet'
-    cols = ['Id', 'Media Type', 'Mention Content']
-    df = pd.read_parquet(file_path, columns=cols)
-    
-    ## tokenize with modin apply
-    tokenized_content = (
-                     df['Mention Content']
-                        .apply(lambda x:tokenizer_ko.tokenize(x) if x != None else x, axis=1)   
-                    )
-    print(len(tokenized_content))
-    
-    ray.shutdown()
+        return doc   
